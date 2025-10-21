@@ -1,0 +1,4 @@
+# torchvision datasets
+data/
+
+.DS_Store
