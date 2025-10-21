@@ -1,4 +1,7 @@
 # torchvision datasets
 data/
 
+# python runtime executables
+*.pyc
+
 .DS_Store
