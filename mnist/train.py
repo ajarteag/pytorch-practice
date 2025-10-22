@@ -14,12 +14,13 @@ from torch import nn
 import argparse
 from pathlib import Path
 from typing import NamedTuple, List
-from utils.model import NeuralNet, evaluate_accuracy
+from utils.model import SimpleMLP, ResNet50, evaluate_accuracy
 from utils.data import load_data
 
 # --- Configuration ---
 class HParams(NamedTuple):
     dataset_name: str
+    model_arch: str
     train_ratio: float
     batch_size: int
     num_workers: int
@@ -30,6 +31,7 @@ class HParams(NamedTuple):
 
 DEFAULT_HPARAMS = HParams(
     dataset_name='mnist', # This default will be overridden by the mandatory CL argument
+    model_arch='simplemlp',
     train_ratio=0.8,
     batch_size=128,
     num_workers=0,
@@ -54,18 +56,30 @@ DATASET_INFO = {
     }
 }
 
+MODEL_ARCHITECTURES = {
+    'simplemlp': SimpleMLP,
+    'resnet50': ResNet50
+}
+
 # --- Argument Parsing ---
 def parse_args():
     """Parses command line arguments, setting mandatory and optional values."""
     parser = argparse.ArgumentParser(description="Train a DNN on MNIST or FashionMNIST.")
     
-    # Mandatory Argument
+    # Mandatory Arguments
     parser.add_argument(
         '--dataset_name', 
         type=str, 
         required=True,
         choices=['mnist', 'fashionmnist'],
         help='Name of the dataset to use: "mnist" or "fashionmnist".'
+    )
+    parser.add_argument(
+        '--model_arch',
+        type=str,
+        required=True,
+        choices=list(MODEL_ARCHITECTURES.keys()),
+        help='Model architecture to use: "simplemlp" or "resnet50".'
     )
     
     # Optional Arguments (with default values from DEFAULT_HPARAMS)
@@ -111,6 +125,7 @@ def parse_args():
     # Consolidate parsed args with fixed/default constants into the final HParams object
     final_hparams = HParams(
         dataset_name=args.dataset_name,
+        model_arch=args.model_arch,
         train_ratio=args.train_ratio,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -150,18 +165,34 @@ def print_run_summary(hparams: HParams, device):
     print(f"Data Workers:       {hparams.num_workers} (for faster data loading)")
 
     print("\n[MODEL ARCHITECTURE (NeuralNet)]")
-    print("Type:               Fully Connected (MLP)")
-    print(f"Input Layer:        784 features (28*28)")
-    print(f"Hidden Layers:      2 layers with ReLU activation")
-    print(f"Output Layer:       10 logits (one for each class)")
-    # Use hparams.hidden_layer_sizes
-    print(f"HLS Search Space:   {hparams.hidden_layer_sizes}")
+    if hparams.model_arch == 'simplemlp':
+        print("Type:               Fully Connected (MLP)")
+        print(f"Input Layer:        784 features (28*28)")
+        print(f"Hidden Layers:      2 layers with ReLU activation")
+        print(f"Output Layer:       10 logits (one for each class)")
+        print(f"HLS Search Space:   {hparams.hidden_layer_sizes}")
+    elif hparams.model_arch == 'resnet50':
+        print("Type:               ResNet50 (Convolutional)")
+        print("Structure:          Bottleneck blocks, 4 stages")
+        print(f"Input Channels:     1 (Greyscale)")
+        print(f"Output Layer:       10 logits (one for each class)")
     print("=====================================================\n")
 
 
 def train_and_validate(hls, train_loader, val_loader, device, loss_fn, hparams: HParams):
     """Handles the training and validation for a single model configuration."""
-    model = NeuralNet(hidden_layer_size=hls)
+    model_class = MODEL_ARCHITECTURES[hparams.model_arch]
+    
+    # Instantiate the correct model based on model_arch
+    if hparams.model_arch == 'simplemlp':
+        model = model_class(hidden_layer_size=hls)
+    elif hparams.model_arch == 'resnet50':
+        # ResNet50 is fixed and ignores hls, but we iterate over hls to match the outer loop structure
+        model = model_class(img_channels=1, num_classes=10)
+    else:
+        # Should not happen due to argparse choices, but good for safety
+        raise ValueError(f"Unsupported model architecture: {hparams.model_arch}")
+    
     model.to(device=device)
     optimizer = torch.optim.Adam(params=model.parameters(), lr=hparams.lr)
     
@@ -178,18 +209,25 @@ def train_and_validate(hls, train_loader, val_loader, device, loss_fn, hparams: 
             loss.backward()
             optimizer.step()
             
-        print(f'hls={hls:3d}, epoch={epoch+1:2d}, loss={loss.item():.3f}')
+        log_hls = f'hls={hls:3d}, ' if hparams.model_arch == 'simplemlp' else ''
+        print(f'{log_hls}epoch={epoch+1:2d}, loss={loss.item():.3f}')
 
     val_accuracy = evaluate_accuracy(model, val_loader, device)
     print(f'(hls={hls}) validation accuracy = {val_accuracy:.2f}%')
     return model, val_accuracy
 
 
-def load_and_test_existing_model(save_path: Path, best_hls: int, test_loader, device):
+def load_and_test_existing_model(save_path: Path, best_hls: int, test_loader, device, model_arch: str):
     """Loads the state dict of an existing model and evaluates its accuracy."""
     print(f"Found existing model at {save_path}. Evaluating...")
     
-    existing_model = NeuralNet(hidden_layer_size=best_hls)
+    model_class = MODEL_ARCHITECTURES[model_arch]
+    
+    # Instantiate the correct model class
+    if model_arch == 'simplemlp':
+        existing_model = model_class(hidden_layer_size=best_hls)
+    elif model_arch == 'resnet50':
+        existing_model = model_class(img_channels=1, num_classes=10)
     existing_model.to(device)
 
     try:
@@ -232,8 +270,11 @@ def main():
     best_model = None
     best_hls = None
 
+    # Handle search space: ResNet50 is a fixed model, SimpleMLP iterates through HLS
+    search_space = hparams.hidden_layer_sizes if hparams.model_arch == 'simplemlp' else [0] # Use [0] for a single ResNet50 run
+
     print("\n--- Starting Hyperparameter Search ---")
-    for hls in hparams.hidden_layer_sizes:
+    for hls in search_space:
         model, accuracy = train_and_validate(
             hls, 
             train_loader, 
@@ -250,10 +291,11 @@ def main():
             best_hls = hls
 
     print("\n--- Final Evaluation and Checkpoint ---")
-    save_path = Path(f'./models/{hparams.dataset_name}_classification_mlp_hls{best_hls}.pt')
+    model_detail = f'_hls{best_hls}' if hparams.model_arch == 'simplemlp' else ''
+    save_path = Path(f'./models/{hparams.dataset_name}_{hparams.model_arch}{model_detail}.pt')
     
     current_test_accuracy = evaluate_accuracy(best_model, test_loader, device)
-    print(f'Current run best model (HLS={best_hls}) test accuracy = {current_test_accuracy:.2f}%')
+    print(f'Current run best model ({hparams.model_arch}{model_detail}) test accuracy = {current_test_accuracy:.2f}%')
 
     # Check if a model already exists at the save_path
     if save_path.exists():
@@ -261,7 +303,8 @@ def main():
             save_path=save_path, 
             best_hls=best_hls, 
             test_loader=test_loader, 
-            device=device
+            device=device,
+            model_arch=hparams.model_arch
         )
         
         if current_test_accuracy > existing_test_accuracy:
